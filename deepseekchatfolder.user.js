@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek Chat 对话分组管理器 (React兼容版)
 // @namespace    http://tampermonkey.net/
-// @version      2.2
+// @version      2.3
 // @description  给 DeepSeek Chat 左侧栏添加对话分组/文件夹功能，修复DOM同步刷新问题
 // @author       You
 // @match        https://chat.deepseek.com/*
@@ -241,7 +241,7 @@
             <span class="group-toggle-area" style="display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;">
                 <span class="group-toggle-icon" style="font-size: 10px; transition: transform 0.2s; display: inline-block; flex-shrink: 0;">${isCollapsed ? '▶' : '▼'}</span>
                 <span style="flex-shrink: 0;">📁</span>
-                <span class="group-name-text" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${groupName}</span>
+                <span class="group-name-text" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-primary);">${groupName}</span>
                 <span class="group-count" style="font-size: 11px; color: var(--dsw-alias-label-tertiary); flex-shrink: 0;">(${chatGroups[groupName] ? chatGroups[groupName].length : 0})</span>
             </span>
             <span class="group-actions" style="display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s; flex-shrink: 0;">
