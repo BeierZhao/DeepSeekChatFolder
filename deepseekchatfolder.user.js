@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DeepSeek Chat 对话分组管理器 (React兼容版)
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  给 DeepSeek Chat 左侧栏添加对话分组/文件夹功能（保留原生菜单）
+// @version      2.2
+// @description  给 DeepSeek Chat 左侧栏添加对话分组/文件夹功能，修复DOM同步刷新问题
 // @author       You
 // @match        https://chat.deepseek.com/*
 // @grant        GM_setValue
@@ -19,6 +19,9 @@
     let groupConfig = GM_getValue(STORAGE_CONFIG_KEY, {});
     let isInitialized = false;
 
+    // 添加互斥锁，防止 MutationObserver 和我们的 DOM 操作死循环
+    let isApplyingDOM = false;
+
     function saveGroups() {
         GM_setValue(STORAGE_KEY, chatGroups);
         GM_setValue(STORAGE_CONFIG_KEY, groupConfig);
@@ -27,26 +30,6 @@
     function getChatIdFromUrl(url) {
         const match = url.match(/\/chat\/s\/([a-f0-9-]+)/);
         return match ? match[1] : null;
-    }
-
-    // 在侧边栏中根据href查找真实的DOM元素
-    function findChatElementByUrl(sidebar, url) {
-        const links = sidebar.querySelectorAll('a[href*="/chat/s/"]');
-        for (const link of links) {
-            if (link.getAttribute('href') === url) {
-                return link;
-            }
-        }
-        // 模糊匹配
-        const chatId = getChatIdFromUrl(url);
-        if (chatId) {
-            for (const link of links) {
-                if (link.getAttribute('href') && link.getAttribute('href').includes(chatId)) {
-                    return link;
-                }
-            }
-        }
-        return null;
     }
 
     // 在当前DOM中查找对话元素
@@ -58,18 +41,6 @@
             }
         }
         return null;
-    }
-
-    function getRandomColor(seed) {
-        const colors = [
-            '#4d6bfe', '#e4773d', '#22c55e', '#f59e0b',
-            '#8b5cf6', '#ec4899', '#06b6d4', '#ef4444'
-        ];
-        let hash = 0;
-        for (let i = 0; i < seed.length; i++) {
-            hash = seed.charCodeAt(i) + ((hash << 5) - hash);
-        }
-        return colors[Math.abs(hash) % colors.length];
     }
 
     // 获取对话分组名
@@ -90,17 +61,17 @@
         if (!chatGroups[groupName]) {
             chatGroups[groupName] = [];
         }
+        // 先从所有组中移除该对话
         for (const group in chatGroups) {
             chatGroups[group] = chatGroups[group].filter(id => id !== chatId);
         }
+        // 加入目标组
         if (!chatGroups[groupName].includes(chatId)) {
             chatGroups[groupName].push(chatId);
         }
         
-        // 【修复 Bug 3】移除自动删除空分组的逻辑，防止新建的空文件夹消失
-        
         saveGroups();
-        applyGroups();
+        applyGroups(); // 立即同步UI
     }
 
     function removeChatFromGroup(chatUrl) {
@@ -110,55 +81,43 @@
             chatGroups[group] = chatGroups[group].filter(id => id !== chatId);
         }
         
-        // 【修复 Bug 3】移除自动删除空分组的逻辑
-        
         saveGroups();
-        applyGroups();
+        applyGroups(); // 立即同步UI
     }
 
-    // 核心：不替换DOM，只移动元素
+    // 核心重构：安全彻底地还原DOM并重新分组
     function applyGroups() {
+        if (isApplyingDOM) return;
+        isApplyingDOM = true; // 上锁
+
         const sidebar = getSidebar();
         if (!sidebar) {
-            console.log('[GroupManager] Sidebar not found for applyGroups');
+            isApplyingDOM = false;
             return;
         }
 
-        // 移除之前的分组容器
-        const oldGroups = sidebar.querySelectorAll('[data-ds-group-container]');
-        oldGroups.forEach(g => {
-            // 将子元素移回父级
-            while (g.firstChild) {
-                if (g.firstChild.getAttribute && g.firstChild.getAttribute('data-ds-group-content')) {
-                    // 展开内容区
-                    while (g.firstChild.firstChild) {
-                        g.parentNode.insertBefore(g.firstChild.firstChild, g);
-                    }
-                    g.parentNode.removeChild(g.firstChild);
-                } else {
-                    g.parentNode.insertBefore(g.firstChild, g);
-                }
+        // --- 1. 彻底清理环境：将所有 a 标签提取回原生侧边栏，并销毁遗留的 wrapper ---
+        const wrappers = sidebar.querySelectorAll('[data-ds-grouped-chat]');
+        wrappers.forEach(w => {
+            const aTag = w.querySelector('a[href*="/chat/s/"]');
+            if (aTag) {
+                // 安全移出：放回侧边栏
+                sidebar.appendChild(aTag); 
             }
-            g.parentNode.removeChild(g);
+            w.remove(); // 彻底销毁 wrapper，防止幽灵节点污染 DOM
         });
 
-        const oldAddBtn = sidebar.querySelector('[data-ds-add-group-btn]');
-        if (oldAddBtn) oldAddBtn.remove();
+        // --- 2. 销毁所有自定义的分组容器和组件 ---
+        const customElements = sidebar.querySelectorAll(
+            '[data-ds-group-container], [data-ds-add-group-btn], [data-ds-ungrouped-header]'
+        );
+        customElements.forEach(el => el.remove());
 
-        const oldUngrouped = sidebar.querySelector('[data-ds-ungrouped-header]');
-        if (oldUngrouped) oldUngrouped.remove();
+        // 收集当前所有的对话元素（刚刚被放回来的，或者新生成的）
+        const allLinks = Array.from(sidebar.querySelectorAll('a[href*="/chat/s/"]'));
 
-        // 收集所有对话元素和它们的URL
-        const chatLinks = [];
-        sidebar.querySelectorAll('a[href*="/chat/s/"]').forEach(link => {
-            chatLinks.push({
-                element: link,
-                url: link.getAttribute('href'),
-                chatId: getChatIdFromUrl(link.getAttribute('href'))
-            });
-        });
-
-        // 先插入新建分组按钮（在第一个元素之前）
+        // --- 3. 重建分组 UI ---
+        // 插入新建分组按钮（在最顶部）
         const firstChild = sidebar.firstChild;
         const addBtn = createAddGroupButton();
         if (firstChild) {
@@ -167,7 +126,6 @@
             sidebar.appendChild(addBtn);
         }
 
-        // 插入引用节点（在此之前的都是分组）
         const insertBeforeNode = addBtn.nextSibling;
 
         // 为每个分组创建容器并移动对话
@@ -179,22 +137,32 @@
                 const el = findChatElementByChatId(sidebar, chatId);
                 if (el) {
                     const contentArea = groupContainer.querySelector('[data-ds-group-content]');
-                    // 将元素包裹并移到分组中
+                    // 将原生元素包裹一层并放入分组内容区
                     const wrapper = createChatWrapper(el, groupName);
                     contentArea.appendChild(wrapper);
                 }
             });
         }
 
-        // 未分组header
+        // --- 4. 处理未分组区域 ---
         const ungroupedHeader = document.createElement('div');
         ungroupedHeader.setAttribute('data-ds-ungrouped-header', 'true');
         ungroupedHeader.style.cssText = 'padding: 8px 10px; font-size: 12px; font-weight: 500; color: var(--dsw-alias-label-tertiary); user-select: none;';
         ungroupedHeader.textContent = '未分组';
         sidebar.insertBefore(ungroupedHeader, insertBeforeNode);
 
-        // 给滚动容器添加底部间距
+        // 把仍然游离在侧边栏底部的未分组链接整理一下（确保它们展示在"未分组"标签下方）
+        allLinks.forEach(link => {
+            if (link.parentElement === sidebar) {
+                sidebar.appendChild(link);
+            }
+        });
+
+        // 解决内容遮挡问题
         addBottomPadding();
+
+        // DOM 更新完毕，稍微延迟后解锁，防止后续原生渲染抢占
+        setTimeout(() => { isApplyingDOM = false; }, 50);
     }
 
     function createChatWrapper(originalElement, groupName) {
@@ -223,24 +191,22 @@
             pointer-events: auto;
         `;
         removeBtn.title = `从 "${groupName}" 移出`;
+        
         removeBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             e.preventDefault();
             const href = originalElement.getAttribute('href');
             removeChatFromGroup(href);
         });
-        // 阻止mousedown冒泡防止触发链接导航
+        
+        // 阻止mousedown冒泡防止误触跳转
         removeBtn.addEventListener('mousedown', (e) => {
             e.stopPropagation();
             e.preventDefault();
         });
 
-        wrapper.addEventListener('mouseenter', () => {
-            removeBtn.style.opacity = '1';
-        });
-        wrapper.addEventListener('mouseleave', () => {
-            removeBtn.style.opacity = '0';
-        });
+        wrapper.addEventListener('mouseenter', () => removeBtn.style.opacity = '1');
+        wrapper.addEventListener('mouseleave', () => removeBtn.style.opacity = '0');
 
         wrapper.appendChild(removeBtn);
         return wrapper;
@@ -253,7 +219,6 @@
 
         const config = groupConfig[groupName] || {};
         const isCollapsed = config.collapsed || false;
-        const color = config.color || getRandomColor(groupName);
 
         const header = document.createElement('div');
         header.style.cssText = `
@@ -271,26 +236,22 @@
             background: var(--dsw-specific-sidebar-fill);
         `;
 
+        // 移除了颜色按钮和相关的随机颜色逻辑，统一使用原色
         header.innerHTML = `
             <span class="group-toggle-area" style="display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;">
                 <span class="group-toggle-icon" style="font-size: 10px; transition: transform 0.2s; display: inline-block; flex-shrink: 0;">${isCollapsed ? '▶' : '▼'}</span>
-                <span style="color: ${color}; flex-shrink: 0;">📁</span>
+                <span style="flex-shrink: 0;">📁</span>
                 <span class="group-name-text" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${groupName}</span>
                 <span class="group-count" style="font-size: 11px; color: var(--dsw-alias-label-tertiary); flex-shrink: 0;">(${chatGroups[groupName] ? chatGroups[groupName].length : 0})</span>
             </span>
             <span class="group-actions" style="display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s; flex-shrink: 0;">
                 <button class="group-rename-btn" title="重命名" style="background: none; border: none; color: var(--dsw-alias-label-tertiary); cursor: pointer; padding: 2px 4px; font-size: 12px;">✏️</button>
-                <button class="group-color-btn" title="换颜色" style="background: none; border: none; color: var(--dsw-alias-label-tertiary); cursor: pointer; padding: 2px 4px; font-size: 12px;">🎨</button>
                 <button class="group-delete-btn" title="删除分组" style="background: none; border: none; color: var(--dsw-alias-label-tertiary); cursor: pointer; padding: 2px 4px; font-size: 12px;">🗑️</button>
             </span>
         `;
 
-        header.addEventListener('mouseenter', () => {
-            header.querySelector('.group-actions').style.opacity = '1';
-        });
-        header.addEventListener('mouseleave', () => {
-            header.querySelector('.group-actions').style.opacity = '0';
-        });
+        header.addEventListener('mouseenter', () => header.querySelector('.group-actions').style.opacity = '1');
+        header.addEventListener('mouseleave', () => header.querySelector('.group-actions').style.opacity = '0');
 
         // 折叠/展开
         header.querySelector('.group-toggle-area').addEventListener('click', (e) => {
@@ -323,27 +284,6 @@
                 saveGroups();
                 applyGroups();
             }
-        });
-
-        // 换颜色
-        header.querySelector('.group-color-btn').addEventListener('click', (e) => {
-            e.stopPropagation();
-            const colorPicker = document.createElement('input');
-            colorPicker.type = 'color';
-            colorPicker.value = color;
-            colorPicker.style.cssText = 'position: absolute; opacity: 0; width: 0; height: 0;';
-            document.body.appendChild(colorPicker);
-            colorPicker.click();
-            colorPicker.addEventListener('change', () => {
-                if (!groupConfig[groupName]) groupConfig[groupName] = {};
-                groupConfig[groupName].color = colorPicker.value;
-                saveGroups();
-                applyGroups();
-                if (document.body.contains(colorPicker)) document.body.removeChild(colorPicker);
-            });
-            colorPicker.addEventListener('blur', () => {
-                if (document.body.contains(colorPicker)) document.body.removeChild(colorPicker);
-            });
         });
 
         // 删除分组
@@ -411,21 +351,16 @@
         `;
         btn.innerHTML = '<span style="font-size: 14px;">📁</span><span>新建分组</span>';
 
-        btn.addEventListener('mouseenter', () => {
-            btn.style.background = 'var(--dsw-alias-interactive-bg-hover-accent)';
-        });
-        btn.addEventListener('mouseleave', () => {
-            btn.style.background = 'var(--dsw-alias-interactive-bg-hover)';
-        });
+        btn.addEventListener('mouseenter', () => btn.style.background = 'var(--dsw-alias-interactive-bg-hover-accent)');
+        btn.addEventListener('mouseleave', () => btn.style.background = 'var(--dsw-alias-interactive-bg-hover)');
 
         btn.addEventListener('click', () => {
             const groupName = prompt('请输入分组名称:');
             if (groupName && !chatGroups[groupName]) {
                 if (!groupConfig[groupName]) groupConfig[groupName] = {};
-                groupConfig[groupName].color = getRandomColor(groupName);
                 chatGroups[groupName] = [];
                 saveGroups();
-                applyGroups();
+                applyGroups(); // 新建后立即重新渲染
             } else if (chatGroups[groupName]) {
                 alert('该分组已存在！');
             }
@@ -442,10 +377,9 @@
         });
     }
 
-    // 【修复 Bug 4】全局缓存当前的关闭菜单函数，防止内存泄漏
+    // 全局缓存当前的关闭菜单函数，防止内存泄漏
     let currentCloseMenu = null;
 
-    // 增强对话链接（拖拽 + 右键菜单）
     function enhanceAllChatLinks() {
         const sidebar = getSidebar();
         if (!sidebar) return;
@@ -475,7 +409,6 @@
                 const oldMenu = document.querySelector('.ds-group-context-menu');
                 if (oldMenu) oldMenu.remove();
 
-                // 【修复 Bug 4】清理之前的监听器
                 if (currentCloseMenu) {
                     document.removeEventListener('click', currentCloseMenu);
                     document.removeEventListener('contextmenu', currentCloseMenu);
@@ -539,7 +472,6 @@
                         const groupName = prompt('请输入新分组名称:');
                         if (groupName && !chatGroups[groupName]) {
                             if (!groupConfig[groupName]) groupConfig[groupName] = {};
-                            groupConfig[groupName].color = getRandomColor(groupName);
                             addChatToGroup(groupName, href);
                         }
                     });
@@ -549,7 +481,6 @@
                     const groupName = prompt('请输入新分组名称:');
                     if (groupName && !chatGroups[groupName]) {
                         if (!groupConfig[groupName]) groupConfig[groupName] = {};
-                        groupConfig[groupName].color = getRandomColor(groupName);
                         addChatToGroup(groupName, href);
                     }
                 });
@@ -564,7 +495,7 @@
                         currentCloseMenu = null;
                     }
                 };
-                currentCloseMenu = closeMenu; // 保存当前监听器以便清理
+                currentCloseMenu = closeMenu; 
                 
                 setTimeout(() => {
                     document.addEventListener('click', closeMenu);
@@ -588,7 +519,7 @@
             }
         }
         
-        // 【修复 Bug 5】兜底方案：万一硬编码类名失效，根据a标签推导侧边栏容器
+        // 兜底方案
         const fallbackLink = document.querySelector('a[href*="/chat/s/"]');
         if (fallbackLink) {
             const container = fallbackLink.closest('div[style*="overflow"]') || fallbackLink.parentElement.parentElement;
@@ -600,25 +531,19 @@
     // 防抖定时器
     let debounceTimer = null;
     let enhanceTimer = null;
-    
-    // 【修复 Bug 1】添加互斥锁，防止 MutationObserver 造成死循环
-    let isApplyingDOM = false;
 
     function observeDOM() {
         const observer = new MutationObserver(() => {
-            // 如果是脚本自己在修改 DOM，直接退出，避免无限死循环
             if (isApplyingDOM) return;
 
-            // 增强新链接
             clearTimeout(enhanceTimer);
             enhanceTimer = setTimeout(enhanceAllChatLinks, 300);
 
-            // 检测是否需要重新应用分组
+            // 被动监测到原生的新对话节点加载时，自动将其整合进分组
             clearTimeout(debounceTimer);
             debounceTimer = setTimeout(() => {
                 const sidebar = getSidebar();
                 if (sidebar) {
-                    // 检查是否有对话不在分组容器中
                     const groupedWrappers = sidebar.querySelectorAll('[data-ds-grouped-chat]');
                     const allLinks = sidebar.querySelectorAll('a[href*="/chat/s/"]');
                     const groupedLinks = new Set();
@@ -631,6 +556,7 @@
                     allLinks.forEach(link => {
                         if (!groupedLinks.has(link) && !link.closest('[data-ds-group-container]')) {
                             const href = link.getAttribute('href');
+                            // 如果页面上出现了属于某个分组的链接，但它目前游离在外，触发刷新
                             if (getChatGroup(href)) {
                                 needsRefresh = true;
                             }
@@ -638,10 +564,7 @@
                     });
 
                     if (needsRefresh) {
-                        isApplyingDOM = true; // 上锁
                         applyGroups();
-                        // DOM 渲染结束后解锁
-                        setTimeout(() => { isApplyingDOM = false; }, 50); 
                     }
                 }
             }, 800);
@@ -651,8 +574,7 @@
     }
 
     function init() {
-        console.log('[GroupManager v2.1] Initializing...');
-
+        console.log('[GroupManager v2.2] Initializing...');
         let attempts = 0;
         const maxAttempts = 40;
 
@@ -661,16 +583,14 @@
             const sidebar = getSidebar();
             if (sidebar && sidebar.querySelectorAll('a[href*="/chat/s/"]').length > 0) {
                 clearInterval(checkReady);
-                console.log('[GroupManager v2.1] Sidebar found, applying groups...');
+                console.log('[GroupManager v2.2] Sidebar found, applying groups...');
                 enhanceAllChatLinks();
                 applyGroups();
                 observeDOM();
                 isInitialized = true;
-                console.log('[GroupManager v2.1] Initialized!');
+                console.log('[GroupManager v2.2] Initialized!');
             } else if (attempts >= maxAttempts) {
                 clearInterval(checkReady);
-                console.log('[GroupManager v2.1] Timeout, will retry...');
-                // 最后尝试
                 setTimeout(() => {
                     enhanceAllChatLinks();
                     applyGroups();
