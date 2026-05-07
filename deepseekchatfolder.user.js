@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         DeepSeek Chat 对话分组管理器 (React兼容版)
 // @namespace    http://tampermonkey.net/
-// @version      2.3
-// @description  给 DeepSeek Chat 左侧栏添加对话分组/文件夹功能，彻底修复刷新与字体颜色继承问题
+// @version      2.2
+// @description  给 DeepSeek Chat 左侧栏添加对话分组/文件夹功能，修复DOM同步刷新问题
 // @author       You
 // @match        https://chat.deepseek.com/*
 // @grant        GM_setValue
@@ -33,8 +33,8 @@
     }
 
     // 在当前DOM中查找对话元素
-    function findChatElementByChatId(parent, chatId) {
-        const links = parent.querySelectorAll('a[href*="/chat/s/"]');
+    function findChatElementByChatId(sidebar, chatId) {
+        const links = sidebar.querySelectorAll('a[href*="/chat/s/"]');
         for (const link of links) {
             if (link.getAttribute('href') && link.getAttribute('href').includes(chatId)) {
                 return link;
@@ -96,45 +96,34 @@
             return;
         }
 
-        // 【关键修复】获取真正的链接父级容器，而不是外层 scrollbar，避免移出分组后跑到列表外不可见
-        let linksParent = sidebar;
-        const firstLink = sidebar.querySelector('a[href*="/chat/s/"]');
-        if (firstLink) {
-            linksParent = firstLink.parentNode;
-        }
-
         // --- 1. 彻底清理环境：将所有 a 标签提取回原生侧边栏，并销毁遗留的 wrapper ---
-        const wrappers = linksParent.querySelectorAll('[data-ds-grouped-chat]');
+        const wrappers = sidebar.querySelectorAll('[data-ds-grouped-chat]');
         wrappers.forEach(w => {
             const aTag = w.querySelector('a[href*="/chat/s/"]');
             if (aTag) {
-                // 安全移出：放回真正的父容器中
-                const container = w.closest('[data-ds-group-container]');
-                if (container) {
-                    linksParent.insertBefore(aTag, container);
-                } else {
-                    linksParent.insertBefore(aTag, w);
-                }
+                // 安全移出：放回侧边栏
+                sidebar.appendChild(aTag); 
             }
             w.remove(); // 彻底销毁 wrapper，防止幽灵节点污染 DOM
         });
 
         // --- 2. 销毁所有自定义的分组容器和组件 ---
-        const customElements = linksParent.querySelectorAll(
+        const customElements = sidebar.querySelectorAll(
             '[data-ds-group-container], [data-ds-add-group-btn], [data-ds-ungrouped-header]'
         );
         customElements.forEach(el => el.remove());
 
         // 收集当前所有的对话元素（刚刚被放回来的，或者新生成的）
-        const allLinks = Array.from(linksParent.querySelectorAll('a[href*="/chat/s/"]'));
+        const allLinks = Array.from(sidebar.querySelectorAll('a[href*="/chat/s/"]'));
 
         // --- 3. 重建分组 UI ---
         // 插入新建分组按钮（在最顶部）
+        const firstChild = sidebar.firstChild;
         const addBtn = createAddGroupButton();
-        if (linksParent.firstChild) {
-            linksParent.insertBefore(addBtn, linksParent.firstChild);
+        if (firstChild) {
+            sidebar.insertBefore(addBtn, firstChild);
         } else {
-            linksParent.appendChild(addBtn);
+            sidebar.appendChild(addBtn);
         }
 
         const insertBeforeNode = addBtn.nextSibling;
@@ -142,10 +131,10 @@
         // 为每个分组创建容器并移动对话
         for (const groupName in chatGroups) {
             const groupContainer = createGroupContainerDOM(groupName);
-            linksParent.insertBefore(groupContainer, insertBeforeNode);
+            sidebar.insertBefore(groupContainer, insertBeforeNode);
 
             chatGroups[groupName].forEach(chatId => {
-                const el = findChatElementByChatId(linksParent, chatId);
+                const el = findChatElementByChatId(sidebar, chatId);
                 if (el) {
                     const contentArea = groupContainer.querySelector('[data-ds-group-content]');
                     // 将原生元素包裹一层并放入分组内容区
@@ -160,12 +149,12 @@
         ungroupedHeader.setAttribute('data-ds-ungrouped-header', 'true');
         ungroupedHeader.style.cssText = 'padding: 8px 10px; font-size: 12px; font-weight: 500; color: var(--dsw-alias-label-tertiary); user-select: none;';
         ungroupedHeader.textContent = '未分组';
-        linksParent.insertBefore(ungroupedHeader, insertBeforeNode);
+        sidebar.insertBefore(ungroupedHeader, insertBeforeNode);
 
-        // 把仍然游离的未分组链接整理一下（排到列表最后）
+        // 把仍然游离在侧边栏底部的未分组链接整理一下（确保它们展示在"未分组"标签下方）
         allLinks.forEach(link => {
-            if (!link.closest('[data-ds-group-container]')) {
-                linksParent.appendChild(link); // Append 到父容器末尾即可无缝显示
+            if (link.parentElement === sidebar) {
+                sidebar.appendChild(link);
             }
         });
 
@@ -247,12 +236,12 @@
             background: var(--dsw-specific-sidebar-fill);
         `;
 
-        // 【关键修复】明确给文字加上 color: var(--dsw-alias-label-primary) 阻止 body 紫色的污染
+        // 移除了颜色按钮和相关的随机颜色逻辑，统一使用原色
         header.innerHTML = `
             <span class="group-toggle-area" style="display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;">
-                <span class="group-toggle-icon" style="font-size: 10px; transition: transform 0.2s; display: inline-block; flex-shrink: 0; color: var(--dsw-alias-label-tertiary);">${isCollapsed ? '▶' : '▼'}</span>
-                <span style="flex-shrink: 0; color: var(--dsw-alias-label-primary);">📁</span>
-                <span class="group-name-text" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--dsw-alias-label-primary);">${groupName}</span>
+                <span class="group-toggle-icon" style="font-size: 10px; transition: transform 0.2s; display: inline-block; flex-shrink: 0;">${isCollapsed ? '▶' : '▼'}</span>
+                <span style="flex-shrink: 0;">📁</span>
+                <span class="group-name-text" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${groupName}</span>
                 <span class="group-count" style="font-size: 11px; color: var(--dsw-alias-label-tertiary); flex-shrink: 0;">(${chatGroups[groupName] ? chatGroups[groupName].length : 0})</span>
             </span>
             <span class="group-actions" style="display: flex; gap: 4px; opacity: 0; transition: opacity 0.2s; flex-shrink: 0;">
@@ -360,7 +349,7 @@
             transition: background 0.2s;
             user-select: none;
         `;
-        btn.innerHTML = '<span style="font-size: 14px; color: var(--dsw-alias-label-primary);">📁</span><span>新建分组</span>';
+        btn.innerHTML = '<span style="font-size: 14px;">📁</span><span>新建分组</span>';
 
         btn.addEventListener('mouseenter', () => btn.style.background = 'var(--dsw-alias-interactive-bg-hover-accent)');
         btn.addEventListener('mouseleave', () => btn.style.background = 'var(--dsw-alias-interactive-bg-hover)');
@@ -585,7 +574,7 @@
     }
 
     function init() {
-        console.log('[GroupManager v2.3] Initializing...');
+        console.log('[GroupManager v2.2] Initializing...');
         let attempts = 0;
         const maxAttempts = 40;
 
@@ -594,12 +583,12 @@
             const sidebar = getSidebar();
             if (sidebar && sidebar.querySelectorAll('a[href*="/chat/s/"]').length > 0) {
                 clearInterval(checkReady);
-                console.log('[GroupManager v2.3] Sidebar found, applying groups...');
+                console.log('[GroupManager v2.2] Sidebar found, applying groups...');
                 enhanceAllChatLinks();
                 applyGroups();
                 observeDOM();
                 isInitialized = true;
-                console.log('[GroupManager v2.3] Initialized!');
+                console.log('[GroupManager v2.2] Initialized!');
             } else if (attempts >= maxAttempts) {
                 clearInterval(checkReady);
                 setTimeout(() => {
