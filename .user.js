@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek Chat 对话分组管理器 (React兼容版)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  给 DeepSeek Chat 左侧栏添加对话分组/文件夹功能（保留原生菜单）
 // @author       You
 // @match        https://chat.deepseek.com/*
@@ -96,11 +96,9 @@
         if (!chatGroups[groupName].includes(chatId)) {
             chatGroups[groupName].push(chatId);
         }
-        for (const group in chatGroups) {
-            if (chatGroups[group].length === 0) {
-                delete chatGroups[group];
-            }
-        }
+        
+        // 【修复 Bug 3】移除自动删除空分组的逻辑，防止新建的空文件夹消失
+        
         saveGroups();
         applyGroups();
     }
@@ -110,10 +108,10 @@
         if (!chatId) return;
         for (const group in chatGroups) {
             chatGroups[group] = chatGroups[group].filter(id => id !== chatId);
-            if (chatGroups[group].length === 0) {
-                delete chatGroups[group];
-            }
         }
+        
+        // 【修复 Bug 3】移除自动删除空分组的逻辑
+        
         saveGroups();
         applyGroups();
     }
@@ -160,12 +158,6 @@
             });
         });
 
-        // 找出已分组和未分组
-        const groupedChatIds = new Set();
-        for (const group in chatGroups) {
-            chatGroups[group].forEach(id => groupedChatIds.add(id));
-        }
-
         // 先插入新建分组按钮（在第一个元素之前）
         const firstChild = sidebar.firstChild;
         const addBtn = createAddGroupButton();
@@ -192,8 +184,6 @@
                     contentArea.appendChild(wrapper);
                 }
             });
-
-            // 如果分组为空，也显示（可能对话被删除了）
         }
 
         // 未分组header
@@ -452,6 +442,9 @@
         });
     }
 
+    // 【修复 Bug 4】全局缓存当前的关闭菜单函数，防止内存泄漏
+    let currentCloseMenu = null;
+
     // 增强对话链接（拖拽 + 右键菜单）
     function enhanceAllChatLinks() {
         const sidebar = getSidebar();
@@ -481,6 +474,13 @@
                 const existingGroup = getChatGroup(href);
                 const oldMenu = document.querySelector('.ds-group-context-menu');
                 if (oldMenu) oldMenu.remove();
+
+                // 【修复 Bug 4】清理之前的监听器
+                if (currentCloseMenu) {
+                    document.removeEventListener('click', currentCloseMenu);
+                    document.removeEventListener('contextmenu', currentCloseMenu);
+                    currentCloseMenu = null;
+                }
 
                 const menu = document.createElement('div');
                 menu.className = 'ds-group-context-menu';
@@ -534,10 +534,7 @@
                     }
                 }
 
-                if (Object.keys(chatGroups).length > 0 && existingGroup) {
-                    // 已有分隔符
-                } else if (Object.keys(chatGroups).length === 0) {
-                    // 没有分组时提示
+                if (Object.keys(chatGroups).length === 0) {
                     addItem('📁 新建分组...', () => {
                         const groupName = prompt('请输入新分组名称:');
                         if (groupName && !chatGroups[groupName]) {
@@ -564,8 +561,11 @@
                         menu.remove();
                         document.removeEventListener('click', closeMenu);
                         document.removeEventListener('contextmenu', closeMenu);
+                        currentCloseMenu = null;
                     }
                 };
+                currentCloseMenu = closeMenu; // 保存当前监听器以便清理
+                
                 setTimeout(() => {
                     document.addEventListener('click', closeMenu);
                     document.addEventListener('contextmenu', closeMenu);
@@ -587,15 +587,28 @@
                 return el;
             }
         }
+        
+        // 【修复 Bug 5】兜底方案：万一硬编码类名失效，根据a标签推导侧边栏容器
+        const fallbackLink = document.querySelector('a[href*="/chat/s/"]');
+        if (fallbackLink) {
+            const container = fallbackLink.closest('div[style*="overflow"]') || fallbackLink.parentElement.parentElement;
+            if (container) return container;
+        }
         return null;
     }
 
     // 防抖定时器
     let debounceTimer = null;
     let enhanceTimer = null;
+    
+    // 【修复 Bug 1】添加互斥锁，防止 MutationObserver 造成死循环
+    let isApplyingDOM = false;
 
     function observeDOM() {
         const observer = new MutationObserver(() => {
+            // 如果是脚本自己在修改 DOM，直接退出，避免无限死循环
+            if (isApplyingDOM) return;
+
             // 增强新链接
             clearTimeout(enhanceTimer);
             enhanceTimer = setTimeout(enhanceAllChatLinks, 300);
@@ -625,7 +638,10 @@
                     });
 
                     if (needsRefresh) {
+                        isApplyingDOM = true; // 上锁
                         applyGroups();
+                        // DOM 渲染结束后解锁
+                        setTimeout(() => { isApplyingDOM = false; }, 50); 
                     }
                 }
             }, 800);
@@ -635,7 +651,7 @@
     }
 
     function init() {
-        console.log('[GroupManager v2] Initializing...');
+        console.log('[GroupManager v2.1] Initializing...');
 
         let attempts = 0;
         const maxAttempts = 40;
@@ -645,15 +661,15 @@
             const sidebar = getSidebar();
             if (sidebar && sidebar.querySelectorAll('a[href*="/chat/s/"]').length > 0) {
                 clearInterval(checkReady);
-                console.log('[GroupManager v2] Sidebar found, applying groups...');
+                console.log('[GroupManager v2.1] Sidebar found, applying groups...');
                 enhanceAllChatLinks();
                 applyGroups();
                 observeDOM();
                 isInitialized = true;
-                console.log('[GroupManager v2] Initialized!');
+                console.log('[GroupManager v2.1] Initialized!');
             } else if (attempts >= maxAttempts) {
                 clearInterval(checkReady);
-                console.log('[GroupManager v2] Timeout, will retry...');
+                console.log('[GroupManager v2.1] Timeout, will retry...');
                 // 最后尝试
                 setTimeout(() => {
                     enhanceAllChatLinks();
